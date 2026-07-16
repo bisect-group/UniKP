@@ -10,7 +10,13 @@ from typing import Dict, Iterable, List, Sequence
 
 import numpy as np
 import torch
-from tqdm.auto import tqdm
+try:
+    from src.utils.rich_progress import progress, write
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from src.utils.rich_progress import progress, write
 from transformers import T5EncoderModel, T5Tokenizer
 
 
@@ -98,7 +104,7 @@ def embed_protein_sequences(
     if current:
         batches.append(current)
 
-    for batch in tqdm(batches, desc="ProtT5 embedding", unit="batch"):
+    for batch in progress(batches, desc="ProtT5 embedding", unit="batch"):
         formatted = [unikp_sequence_text(sequence) for sequence in batch]
         encoded = tokenizer.batch_encode_plus(formatted, add_special_tokens=True, padding=True)
         input_ids = torch.tensor(encoded["input_ids"], device=device)
@@ -180,7 +186,7 @@ def embed_smiles_values(
 
     unique = sorted({normalize_smiles(smiles) for smiles in smiles_values}, key=len, reverse=True)
     result: Dict[str, np.ndarray] = {}
-    for start in tqdm(range(0, len(unique), batch_size), desc="SMILES Transformer embedding", unit="batch"):
+    for start in progress(range(0, len(unique), batch_size), desc="SMILES Transformer embedding", unit="batch"):
         batch = unique[start : start + batch_size]
         ids = [smiles_to_ids(smiles, vocab) for smiles in batch]
         src = torch.tensor(ids, dtype=torch.long, device=device).t().contiguous()
