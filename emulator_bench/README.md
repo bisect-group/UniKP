@@ -1,98 +1,54 @@
 # UniKP emulator_bench
 
-This directory adds EMULaToR split retraining wrappers for UniKP without modifying the original repository scripts.
+Multi-seed evaluation of UniKP with its original settings on the default EMULaToR splits.
+Tasks: `kcat` and `km` (`data/processed/datasets/kinetic_dataset/<task>`). The original UniKP scripts are not changed.
 
-## Model Inputs
+## Model
 
-Each sample uses:
+- Protein: 1024-d mean-pooled ProtT5-XL-UniRef50 vector (fp32, frozen).
+- Substrate: 1024-d SMILES Transformer vector (`vocab.pkl`, `trfm_12_23000.pkl`). The vector depends on the row position, see below.
+- Predictor: sklearn `ExtraTreesRegressor()` with library defaults (100 trees, no depth limit), trained on the concatenated 2048-d vector. There is no validation use, no early stopping, and no tuning.
+- Target: `log10_value`.
 
-- `sequence`: enzyme amino acid sequence
-- `smiles`: substrate SMILES
-- `log10_value`: default regression target
+The wrapper sets only `n_jobs` and `random_state=seed`.
 
-The feature vector is the original UniKP representation:
+## Inputs and outputs
 
-- 1024-dimensional protein vector from frozen `Rostlab/prot_t5_xl_uniref50`
-- 1024-dimensional substrate vector from the repository SMILES Transformer (`vocab.pkl`, `trfm_12_23000.pkl`)
-- concatenated 2048-dimensional input to sklearn `ExtraTreesRegressor`
+Splits are read from `<dataset_root>/<task>/<split_group>[/threshold_<t>]/{train,val,test}.parquet`.
+Split groups: `random_splits_grouped_sequence`, `random_splits_grouped_smiles`, `uniprot_time_splits`, `enzyme_sequence_splits`, `substrate_splits`. Threshold folders are found on disk.
 
-The default preprocessing drops SMILES containing `.` to match the original UniKP kcat training script. Pass `--keep_dot_smiles` to keep multi-component SMILES.
+Everything the wrapper writes goes under `--work_dir` (default `outputs/baselines/UniKP`). It never writes to the split folders.
 
-## Cache Layout
-
-Default dataset root:
-
-```bash
-/home/adhil/github/EMULaToR/data/processed/baselines/UniKP
+```
+<work_dir>/embeddings/proteins/...                   shared cache, built once
+<work_dir>/embeddings/smiles_trfm_v2_<fingerprint>/... one vector per (SMILES, chunk column)
+<work_dir>/<task>/feature_matrices/<group>/<name>/   train/val/test .npz + metadata
+<work_dir>/<task>/results/<group>/<name>/seed_<s>/   metrics, predictions, model.joblib
 ```
 
-Embedding caches are written once under:
+## SMILES Transformer rule
+
+The original scripts encode the full, unsplit dataset in chunks of 100 rows. Its positional encoding slices along the batch axis, so a vector depends on the column of the row in the chunk. The wrapper copies this exactly:
+
+- The full table is `<dataset_root>/<task>/<task>_kinetic_params_1d.parquet` (stored order, read only).
+- Table row `r` gets the vector at column `r % 100`. One SMILES on several rows can have several vectors.
+- A split row is linked to its table row by the key `ECNumber, uniprot_id, sequence, smiles, value, Organism, pH, Temperature, mutations, substrate, source, enzymeType`. The key is unique in both tables and every split row has a match. A row without a match uses column 0, and the count is printed.
+- The cache holds one vector per (SMILES, column) pair. The cache folder name and the feature-matrix fingerprint contain a hash of the table SMILES column, so a changed table rebuilds them.
+
+Check: on CPU the vectors for the first 250 rows of the kcat table equal the original `smiles_to_vec` output exactly (max abs diff 0.0).
+
+Existing caches, matrices, and finished runs are skipped on rerun.
+
+## Run
+
+Seeds are 666 777 888. Run from the submodule root with the `mldb` environment.
+The original kcat script drops multi-component SMILES (containing `.`) from the training data. The Km script does not. Use `--drop_dot_smiles_train` for kcat only.
 
 ```bash
-<base_dir>/embeddings/proteins/<hash-prefix>/<hash>.npz
-<base_dir>/embeddings/smiles_trfm/<hash-prefix>/<hash>.npz
-<base_dir>/embeddings/manifest.json
+CUDA_VISIBLE_DEVICES=1 python emulator_bench/launch_parallel_retrain_original.py --tasks kcat --drop_dot_smiles_train --num_workers 4 --model_n_jobs 8
+CUDA_VISIBLE_DEVICES=1 python emulator_bench/launch_parallel_retrain_original.py --tasks km --num_workers 4 --model_n_jobs 8
+python emulator_bench/aggregate_unikp_results.py
 ```
 
-Split feature matrices are materialized under:
-
-```bash
-<base_dir>/feature_matrices/<split_group>/<split_name>/{train,val,test}.npz
-<base_dir>/feature_matrices/<split_group>/<split_name>/{train,val,test}_metadata.csv
-```
-
-Repeated cache, feature, retrain, and Optuna commands skip completed artifacts unless an overwrite flag is passed.
-
-## Original ExtraTrees Settings
-
-The original UniKP code uses `ExtraTreesRegressor()` with no explicit hyperparameters. The bench encodes those defaults explicitly:
-
-- `n_estimators=100`
-- `criterion="squared_error"`
-- `max_depth=None`
-- `min_samples_split=2`
-- `min_samples_leaf=1`
-- `max_features=1.0`
-- `bootstrap=False`
-- `warm_start=False`
-
-`--model_n_jobs` is the CPU-control exception. It sets sklearn `n_jobs` and related thread environment variables. The default `--random_state_mode seed` makes multiruns reproducible; `--random_state_mode none` restores the original constructor behavior.
-
-## Primary Workflow
-
-Run from the repository root with the `mldb` conda environment. To use physical GPU 1 for embedding, mask it and use `cuda:0` inside the process:
-
-```bash
-CUDA_VISIBLE_DEVICES=1 conda run -n mldb python emulator_bench/launch_parallel_retrain_original.py \
-  --cache_device cuda:0 \
-  --split_groups random_splits_grouped_sequence random_splits_grouped_smiles enzyme_sequence_splits substrate_splits conformer_cosine_splits enzyme_structure_splits uniprot_time_splits \
-  --seeds 0 1 2 3 4 \
-  --num_workers 4 \
-  --model_n_jobs 8
-```
-
-This command builds missing embedding caches, builds missing feature matrices, and launches original-setting retraining jobs in parallel. If interrupted, rerun the same command; completed caches, matrices, and runs are skipped.
-
-## Optuna
-
-Optuna is included for later use and tunes only ExtraTrees hyperparameters. Build caches and matrices first, then run:
-
-```bash
-conda run -n mldb python emulator_bench/tune_optuna.py \
-  --split_groups random_splits_grouped_sequence \
-  --seeds 0 \
-  --model_n_jobs 8 \
-  --n_trials 20 \
-  --study_name unikp_optuna_random_sequence
-```
-
-Retrain from the best study result:
-
-```bash
-conda run -n mldb python emulator_bench/launch_parallel_retrain_from_optuna.py \
-  --hparams_json /home/adhil/github/EMULaToR/data/processed/baselines/UniKP/optuna_studies/unikp_optuna_random_sequence_best_hparams.json \
-  --split_groups random_splits_grouped_sequence \
-  --seeds 0 1 2 3 4 \
-  --num_workers 4 \
-  --model_n_jobs 8
-```
+Use `--dataset_root` and `--work_dir` to change the paths. The same `--drop_dot_smiles_train` choice must be used in the cache and feature steps of one task (the launcher passes it on).
+`--max_rows_per_split N` is for smoke tests only.

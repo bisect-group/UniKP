@@ -1,8 +1,5 @@
-import csv
 import hashlib
-import inspect
 import json
-import math
 import os
 import random
 from pathlib import Path
@@ -13,20 +10,20 @@ import pandas as pd
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MODEL_NAME = "UniKP"
-DEFAULT_BASE_DIR = Path(f"/home/adhil/github/EMULaToR/data/processed/baselines/{DEFAULT_MODEL_NAME}")
-DEFAULT_EMBEDDINGS_DIR = DEFAULT_BASE_DIR / "embeddings"
-DEFAULT_FEATURE_DIRNAME = "feature_matrices"
-DEFAULT_RESULTS_DIRNAME = "unikp_original_retrain"
+EMULATOR_ROOT = REPO_ROOT.parents[1]
+DEFAULT_DATASET_ROOT = EMULATOR_ROOT / "data" / "processed" / "datasets" / "kinetic_dataset"
+DEFAULT_WORK_DIR = EMULATOR_ROOT / "outputs" / "baselines" / "UniKP"
+TASKS = ["kcat", "km"]
+CACHE_VERSION = 2
+TRFM_CHUNK = 100
+ROW_KEY_COLUMNS = ["ECNumber", "uniprot_id", "sequence", "smiles", "value", "Organism", "pH", "Temperature", "mutations", "substrate", "source", "enzymeType"]
+DEFAULT_SEEDS = [666, 777, 888]
 DEFAULT_SPLIT_GROUPS = [
     "random_splits_grouped_sequence",
     "random_splits_grouped_smiles",
+    "uniprot_time_splits",
     "enzyme_sequence_splits",
     "substrate_splits",
-    "conformer_cosine_splits",
-    "enzyme_structure_splits",
-    "uniprot_time_splits",
-    "group_shuffle_splits",
 ]
 
 
@@ -46,18 +43,46 @@ def protein_cache_key(sequence: str) -> str:
     return stable_hash(normalize_sequence(sequence))
 
 
-def smiles_cache_key(smiles: str) -> str:
-    return stable_hash(normalize_smiles(smiles))
-
-
 def protein_cache_path(embeddings_dir: Path, sequence: str) -> Path:
     key = protein_cache_key(sequence)
     return Path(embeddings_dir) / "proteins" / key[:2] / f"{key}.npz"
 
 
-def smiles_cache_path(embeddings_dir: Path, smiles: str) -> Path:
-    key = smiles_cache_key(smiles)
-    return Path(embeddings_dir) / "smiles_trfm" / key[:2] / f"{key}.npz"
+def smiles_cache_path(embeddings_dir: Path, smiles: str, column: int, fingerprint: str) -> Path:
+    """One vector per (SMILES, chunk column); the folder name holds the table fingerprint."""
+    key = stable_hash(f"{normalize_smiles(smiles)}\t{column}")
+    return Path(embeddings_dir) / f"smiles_trfm_v{CACHE_VERSION}_{fingerprint}" / key[:2] / f"{key}.npz"
+
+
+def table_path(dataset_root: Path, task: str) -> Path:
+    return Path(dataset_root) / task / f"{task}_kinetic_params_1d.parquet"
+
+
+def row_keys(frame: pd.DataFrame) -> pd.Series:
+    return frame[ROW_KEY_COLUMNS].astype(str).agg("\x1f".join, axis=1)
+
+
+class TaskTable:
+    """The full unsplit task table. The original UniKP encodes it in chunks of 100 rows.
+
+    Its positional encoding is added along the batch axis, so row r gets the vector of chunk column r % 100.
+    """
+
+    def __init__(self, dataset_root: Path, task: str):
+        path = table_path(dataset_root, task)
+        frame = pd.read_parquet(path, columns=ROW_KEY_COLUMNS)
+        keys = row_keys(frame)
+        if keys.duplicated().any():
+            raise ValueError(f"Row key is not unique in {path}")
+        self.columns = dict(zip(keys, np.arange(len(keys)) % TRFM_CHUNK))
+        self.fingerprint = stable_hash("\n".join(frame["smiles"].astype(str)))[:12]
+
+    def attach_columns(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Add `trfm_column`. Rows missing from the table use column 0 (the count is printed)."""
+        columns = row_keys(frame).map(self.columns)
+        if columns.isna().any():
+            print(f"WARNING: {int(columns.isna().sum())} of {len(frame)} split rows are not in the task table; using column 0.", flush=True)
+        return frame.assign(trfm_column=columns.fillna(0).astype(int))
 
 
 def ensure_parent(path: Path) -> None:
@@ -77,16 +102,6 @@ def atomic_save_csv(path: Path, frame: pd.DataFrame) -> None:
     tmp_path = Path(str(path) + ".tmp")
     frame.to_csv(tmp_path, index=False)
     tmp_path.replace(path)
-
-
-def append_csv_row(path: Path, row: Dict) -> None:
-    ensure_parent(path)
-    exists = Path(path).exists()
-    with open(path, "a", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
-        if not exists:
-            writer.writeheader()
-        writer.writerow(row)
 
 
 def read_table(path: Path) -> pd.DataFrame:
@@ -118,130 +133,44 @@ def _find_split_file(directory: Path, stem: str) -> Optional[Path]:
     return None
 
 
-def _is_direct_split_group(split_group: str) -> bool:
-    return split_group.startswith("random_splits_grouped_") or split_group in {"uniprot_time_splits", "group_shuffle_splits"}
-
-
-def _threshold_value(name: str) -> float:
-    try:
-        return float(name.split("threshold_")[-1])
-    except Exception:
-        return math.inf
-
-
-def _difficulty_labels_for_thresholds(names: List[str]) -> Dict[str, str]:
-    ordered = sorted(names, key=_threshold_value)
-    if len(ordered) == 1:
-        return {ordered[0]: "single"}
-    if len(ordered) == 2:
-        return {ordered[0]: "hard", ordered[1]: "easy"}
-    if len(ordered) == 3:
-        return {ordered[0]: "hard", ordered[1]: "medium", ordered[2]: "easy"}
-    return {name: f"rank_{idx}" for idx, name in enumerate(ordered, start=1)}
-
-
-def normalize_threshold_args(thresholds: Optional[Iterable[str]], threshold: Optional[str] = None) -> Optional[List[str]]:
-    values: List[str] = []
-    if thresholds:
-        values.extend(str(value) for value in thresholds if str(value).strip())
-    if threshold and str(threshold).strip():
-        values.append(str(threshold))
-    if not values:
-        return None
-    deduped: List[str] = []
-    seen = set()
-    for value in values:
-        if value not in seen:
-            deduped.append(value)
-            seen.add(value)
-    return deduped
-
-
-def discover_split_jobs(
-    base_dir: Path,
-    split_groups: Optional[Iterable[str]] = None,
-    thresholds: Optional[Iterable[str]] = None,
-) -> List[Dict[str, str]]:
-    base_dir = Path(base_dir)
-    split_groups = list(split_groups or DEFAULT_SPLIT_GROUPS)
-    threshold_filter = set(thresholds) if thresholds is not None else None
+def discover_split_jobs(base_dir: Path, split_groups: Optional[Iterable[str]] = None) -> List[Dict[str, str]]:
+    """Find `<group>/{train,val,test}` or `<group>/threshold_*/{train,val,test}` folders."""
     jobs: List[Dict[str, str]] = []
-
-    for split_group in split_groups:
-        group_dir = base_dir / split_group
+    for split_group in split_groups or DEFAULT_SPLIT_GROUPS:
+        group_dir = Path(base_dir) / split_group
         if not group_dir.exists():
             continue
-
-        train_path = _find_split_file(group_dir, "train")
-        val_path = _find_split_file(group_dir, "val")
-        test_path = _find_split_file(group_dir, "test")
-        if train_path and val_path and test_path:
-            jobs.append(
-                {
-                    "split_group": split_group,
-                    "split_name": split_group if _is_direct_split_group(split_group) else group_dir.name,
-                    "difficulty": split_group,
-                    "root_dir": str(group_dir),
-                    "train_path": str(train_path),
-                    "val_path": str(val_path),
-                    "test_path": str(test_path),
-                }
-            )
-            continue
-
-        candidate_dirs = []
-        for child in sorted(group_dir.iterdir()):
-            if not child.is_dir():
-                continue
-            if threshold_filter is not None and child.name not in threshold_filter:
-                continue
-            if child.name.startswith("threshold_") or child.name in {"easy", "medium", "hard"}:
-                candidate_dirs.append(child)
-
-        threshold_names = [child.name for child in candidate_dirs if child.name.startswith("threshold_")]
-        difficulty_by_name = _difficulty_labels_for_thresholds(threshold_names)
-        for child in candidate_dirs:
-            train_path = _find_split_file(child, "train")
-            val_path = _find_split_file(child, "val")
-            test_path = _find_split_file(child, "test")
-            if not (train_path and val_path and test_path):
-                continue
-            jobs.append(
-                {
-                    "split_group": split_group,
-                    "split_name": child.name,
-                    "difficulty": difficulty_by_name.get(child.name, child.name),
-                    "root_dir": str(child),
-                    "train_path": str(train_path),
-                    "val_path": str(val_path),
-                    "test_path": str(test_path),
-                }
-            )
+        candidates = [(split_group, group_dir)]
+        if not (group_dir / "train.parquet").exists():
+            candidates = [(child.name, child) for child in sorted(group_dir.glob("threshold_*")) if child.is_dir()]
+        for split_name, directory in candidates:
+            paths = {name: _find_split_file(directory, name) for name in ("train", "val", "test")}
+            if all(paths.values()):
+                jobs.append({"split_group": split_group, "split_name": split_name, **{f"{k}_path": str(v) for k, v in paths.items()}})
     return jobs
 
 
-def resolve_single_split_job(base_dir: Path, split_group: str, threshold: Optional[str] = None) -> Dict[str, str]:
-    thresholds = None if _is_direct_split_group(split_group) else normalize_threshold_args(None, threshold)
-    jobs = discover_split_jobs(base_dir, split_groups=[split_group], thresholds=thresholds)
-    if not jobs:
-        detail = f"{split_group}/{threshold}" if threshold else split_group
-        raise FileNotFoundError(f"No split job found for {detail} in {base_dir}")
-    if threshold is None or _is_direct_split_group(split_group):
-        if len(jobs) > 1 and not _is_direct_split_group(split_group):
-            available = ", ".join(job["split_name"] for job in jobs)
-            raise ValueError(f"Multiple jobs found for {split_group}; specify --threshold. Available: {available}")
-        return jobs[0]
-    for job in jobs:
-        if job["split_name"] == threshold:
-            return job
-    available = ", ".join(job["split_name"] for job in jobs)
-    raise FileNotFoundError(f"Threshold {threshold} not found for {split_group}. Available: {available}")
+def feature_job_dir(feature_root: Path, split_group: str, split_name: str) -> Path:
+    return Path(feature_root) / split_group / split_name
 
 
-def feature_job_dir(base_dir: Path, feature_dirname: str, split_group: str, split_name: str) -> Path:
-    safe_group = str(split_group).replace("/", "_")
-    safe_name = str(split_name).replace("/", "_")
-    return Path(base_dir) / feature_dirname / safe_group / safe_name
+def split_fingerprint(path: Path, split: str, args, table_fingerprint: str) -> str:
+    """Hash of the inputs and flags that determine a feature matrix."""
+    stat = Path(path).stat()
+    drop_dot = bool(args.drop_dot_smiles_train) and split == "train"
+    key = [str(Path(path).resolve()), stat.st_size, stat.st_mtime_ns, args.sequence_col, args.smiles_col, args.target_col, args.max_rows_per_split, drop_dot, table_fingerprint, CACHE_VERSION]
+    return hashlib.sha1(json.dumps(key).encode()).hexdigest()
+
+
+def prepare_frame(frame: pd.DataFrame, split: str, args, path: Path, table: TaskTable) -> pd.DataFrame:
+    """Add the chunk column, then apply row cap (smoke tests) and the optional multi-component SMILES filter to the train split."""
+    require_columns(frame, [args.sequence_col, args.smiles_col, args.target_col, *ROW_KEY_COLUMNS], path)
+    frame = table.attach_columns(frame)
+    if args.max_rows_per_split is not None:
+        frame = frame.head(int(args.max_rows_per_split))
+    if split == "train" and args.drop_dot_smiles_train:
+        frame = frame[~frame[args.smiles_col].astype(str).str.contains(".", regex=False)]
+    return frame[pd.notna(frame[args.target_col])].reset_index(drop=True)
 
 
 def regression_metrics(y_true, y_pred) -> Dict[str, float]:
@@ -272,40 +201,6 @@ def regression_metrics(y_true, y_pred) -> Dict[str, float]:
         "pearson": pearson,
         "spearman": spearman,
     }
-
-
-def metric_direction(metric: str) -> str:
-    return "minimize" if metric in {"mse", "rmse", "mae"} else "maximize"
-
-
-def original_extra_trees_params(model_n_jobs=None, random_state=None, overrides: Optional[Dict] = None) -> Dict:
-    params = {
-        "n_estimators": 100,
-        "criterion": "squared_error",
-        "max_depth": None,
-        "min_samples_split": 2,
-        "min_samples_leaf": 1,
-        "min_weight_fraction_leaf": 0.0,
-        "max_features": 1.0,
-        "max_leaf_nodes": None,
-        "min_impurity_decrease": 0.0,
-        "bootstrap": False,
-        "oob_score": False,
-        "n_jobs": model_n_jobs,
-        "random_state": random_state,
-        "verbose": 0,
-        "warm_start": False,
-        "ccp_alpha": 0.0,
-        "max_samples": None,
-        "monotonic_cst": None,
-    }
-    if overrides:
-        params.update({key: value for key, value in overrides.items() if value is not None})
-
-    from sklearn.ensemble import ExtraTreesRegressor
-
-    accepted = set(inspect.signature(ExtraTreesRegressor).parameters)
-    return {key: value for key, value in params.items() if key in accepted}
 
 
 def summarize_seed_runs(rows: List[Dict], group_cols: List[str], metric_cols: List[str]) -> pd.DataFrame:

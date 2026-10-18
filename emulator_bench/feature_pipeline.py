@@ -4,19 +4,18 @@ import re
 import sys
 import zipfile
 import zlib
-from contextlib import nullcontext
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterator, List, Sequence, Tuple
 
 import numpy as np
 import torch
 try:
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 from transformers import T5EncoderModel, T5Tokenizer
 
 
@@ -36,28 +35,6 @@ SMILES_VECTOR_DIM = 1024
 PROTEIN_VECTOR_DIM = 1024
 
 
-def resolve_amp_dtype(device: torch.device):
-    if device.type != "cuda" or not torch.cuda.is_available():
-        return None, "fp32"
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    major, _minor = torch.cuda.get_device_capability(index)
-    if major >= 8:
-        return torch.bfloat16, "bf16-mixed"
-    return torch.float16, "fp16-mixed"
-
-
-def autocast_context(device: torch.device, dtype):
-    if device.type == "cuda" and dtype is not None:
-        return torch.autocast(device_type="cuda", dtype=dtype)
-    return nullcontext()
-
-
-def enable_cuda_fast_math() -> None:
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-
-
 def unikp_sequence_text(sequence: str) -> str:
     sequence = normalize_sequence(sequence)
     if len(sequence) > 1000:
@@ -75,21 +52,19 @@ def load_prot_t5(device: torch.device):
     return tokenizer, model
 
 
-def embed_protein_sequences(
+def iter_protein_embeddings(
     sequences: Sequence[str],
     device: torch.device,
     batch_size: int = 4,
     max_tokens: int = 4096,
-) -> Dict[str, np.ndarray]:
+) -> Iterator[Tuple[str, np.ndarray]]:
+    """Yield (sequence, vector) after each batch so callers can save finished work."""
     if not sequences:
-        return {}
-    enable_cuda_fast_math()
+        return
     tokenizer, model = load_prot_t5(device)
-    amp_dtype, precision = resolve_amp_dtype(device)
-    print(f"ProtT5 device: {device} | precision: {precision}", flush=True)
+    print(f"ProtT5 device: {device} | precision: fp32", flush=True)
 
     unique = sorted({normalize_sequence(seq) for seq in sequences}, key=len, reverse=True)
-    result: Dict[str, np.ndarray] = {}
     batches: List[List[str]] = []
     current: List[str] = []
     current_tokens = 0
@@ -106,18 +81,17 @@ def embed_protein_sequences(
 
     for batch in progress(batches, desc="ProtT5 embedding", unit="batch"):
         formatted = [unikp_sequence_text(sequence) for sequence in batch]
-        encoded = tokenizer.batch_encode_plus(formatted, add_special_tokens=True, padding=True)
+        encoded = tokenizer(formatted, add_special_tokens=True, padding=True)
         input_ids = torch.tensor(encoded["input_ids"], device=device)
         attention_mask = torch.tensor(encoded["attention_mask"], device=device)
-        with torch.no_grad(), autocast_context(device, amp_dtype):
+        with torch.no_grad():
             hidden = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         hidden = hidden.detach().float().cpu()
         mask = attention_mask.detach().cpu()
         for idx, sequence in enumerate(batch):
             seq_len = int((mask[idx] == 1).sum().item())
             vector = hidden[idx, : seq_len - 1].mean(dim=0).numpy().astype(np.float32, copy=False)
-            result[sequence] = vector
-    return result
+            yield sequence, vector
 
 
 def load_smiles_transformer(device: torch.device):
@@ -149,10 +123,11 @@ def smiles_to_ids(smiles: str, vocab) -> List[int]:
     return ids
 
 
-def _encode_smiles_batch(model, src: torch.Tensor, device: torch.device, amp_dtype) -> np.ndarray:
-    with torch.no_grad(), autocast_context(device, amp_dtype):
+def _encode_smiles_batch(model, src: torch.Tensor, columns: torch.Tensor) -> np.ndarray:
+    """Encode src (T, B). Column b gets pe[b], as in the original, where the pe slice runs over the batch axis."""
+    with torch.no_grad():
         embedded = model.embed(src)
-        embedded = model.pe(embedded)
+        embedded = embedded + model.pe.pe[0, columns]
         output = embedded
         for idx in range(model.trfm.encoder.num_layers - 1):
             output = model.trfm.encoder.layers[idx](output, src_mask=None)
@@ -172,28 +147,29 @@ def _encode_smiles_batch(model, src: torch.Tensor, device: torch.device, amp_dty
     ).astype(np.float32, copy=False)
 
 
-def embed_smiles_values(
-    smiles_values: Sequence[str],
+def iter_smiles_embeddings(
+    pairs: Sequence[Tuple[str, int]],
     device: torch.device,
     batch_size: int = 256,
-) -> Dict[str, np.ndarray]:
-    if not smiles_values:
-        return {}
-    enable_cuda_fast_math()
-    vocab, model = load_smiles_transformer(device)
-    amp_dtype, precision = resolve_amp_dtype(device)
-    print(f"SMILES Transformer device: {device} | precision: {precision}", flush=True)
+) -> Iterator[Tuple[Tuple[str, int], np.ndarray]]:
+    """Yield ((smiles, column), vector) after each batch so callers can save finished work.
 
-    unique = sorted({normalize_smiles(smiles) for smiles in smiles_values}, key=len, reverse=True)
-    result: Dict[str, np.ndarray] = {}
+    Inputs are padded to 220 tokens, so a vector depends only on the SMILES and its column.
+    """
+    if not pairs:
+        return
+    vocab, model = load_smiles_transformer(device)
+    print(f"SMILES Transformer device: {device} | precision: fp32", flush=True)
+
+    unique = sorted({(normalize_smiles(smiles), int(column)) for smiles, column in pairs}, key=lambda pair: len(pair[0]), reverse=True)
     for start in progress(range(0, len(unique), batch_size), desc="SMILES Transformer embedding", unit="batch"):
         batch = unique[start : start + batch_size]
-        ids = [smiles_to_ids(smiles, vocab) for smiles in batch]
+        ids = [smiles_to_ids(smiles, vocab) for smiles, _ in batch]
         src = torch.tensor(ids, dtype=torch.long, device=device).t().contiguous()
-        vectors = _encode_smiles_batch(model, src, device=device, amp_dtype=amp_dtype)
-        for idx, smiles in enumerate(batch):
-            result[smiles] = vectors[idx]
-    return result
+        columns = torch.tensor([column for _, column in batch], dtype=torch.long, device=device)
+        vectors = _encode_smiles_batch(model, src, columns)
+        for idx, pair in enumerate(batch):
+            yield pair, vectors[idx]
 
 
 def save_npz_atomic(path: Path, payload: Dict[str, np.ndarray]) -> None:
@@ -218,12 +194,3 @@ def load_cached_vector(path: Path, key: str = "vector") -> np.ndarray:
     if key not in payload:
         raise KeyError(f"Missing `{key}` in cache file {path}")
     return payload[key].astype(np.float32, copy=False)
-
-
-def iter_unique_from_frames(frames: Iterable, sequence_col: str, smiles_col: str):
-    sequences = set()
-    smiles_values = set()
-    for frame in frames:
-        sequences.update(normalize_sequence(value) for value in frame[sequence_col].astype(str))
-        smiles_values.update(normalize_smiles(value) for value in frame[smiles_col].astype(str))
-    return sorted(sequences), sorted(smiles_values)
