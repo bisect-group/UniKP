@@ -27,10 +27,9 @@ from build_vocab import WordVocab
 from pretrain_trfm import TrfmSeq2seq
 from utils import split
 
-from emulator_bench.common import normalize_sequence, normalize_smiles
+from emulator_bench.common import PROT_MODEL_ID, normalize_sequence, normalize_smiles
 
 
-PROT_MODEL_ID = "Rostlab/prot_t5_xl_uniref50"
 SMILES_VECTOR_DIM = 1024
 PROTEIN_VECTOR_DIM = 1024
 

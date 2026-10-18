@@ -53,7 +53,7 @@ def build_experiments(args):
         for job in discover_split_jobs(Path(args.dataset_root) / task, split_groups=args.split_groups):
             fdir = feature_job_dir(Path(args.work_dir) / task / "feature_matrices", job["split_group"], job["split_name"])
             for seed in args.seeds:
-                out_dir = Path(args.work_dir) / task / "results" / job["split_group"] / job["split_name"] / f"seed_{seed}"
+                out_dir = Path(args.work_dir) / task / job["split_group"] / job["split_name"] / f"seed_{seed}"
                 experiments.append(
                     {"task": task, "split_group": job["split_group"], "split_name": job["split_name"], "feature_dir": fdir, "out_dir": out_dir, "seed": int(seed)}
                 )
@@ -101,7 +101,7 @@ def run_parallel(experiments, args):
             with lock:
                 rows.append(row)
 
-    threads = [threading.Thread(target=worker, daemon=True) for _ in range(args.num_workers)]
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(args.jobs)]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -125,7 +125,7 @@ def main():
     parser.add_argument("--work_dir", type=str, default=str(DEFAULT_WORK_DIR), help="Output folder for embeddings, feature matrices, and results.")
     parser.add_argument("--split_groups", nargs="+", default=DEFAULT_SPLIT_GROUPS)
     parser.add_argument("--seeds", nargs="+", type=int, default=DEFAULT_SEEDS)
-    parser.add_argument("--num_workers", type=int, default=1)
+    parser.add_argument("--jobs", type=int, default=1, help="Concurrent training runs. Extra Trees trains on CPU, so there is no --gpus or --amp.")
     parser.add_argument("--model_n_jobs", type=int, default=None)
     parser.add_argument("--cache_device", type=str, default="cuda:0")
     parser.add_argument("--drop_dot_smiles_train", action="store_true", help="Drop multi-component SMILES from train (original kcat script only).")
@@ -147,7 +147,7 @@ def main():
     frame = pd.DataFrame(rows)
     for task in args.tasks:
         task_rows = [row for row in rows if row["task"] == task]
-        root = Path(args.work_dir) / task / "results"
+        root = Path(args.work_dir) / task
         root.mkdir(parents=True, exist_ok=True)
         metric_cols = [col for col in frame.columns if col.startswith("test_")]
         atomic_save_csv(root / "retrain_summary_runs.csv", pd.DataFrame(task_rows))

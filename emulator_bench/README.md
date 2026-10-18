@@ -15,15 +15,15 @@ The wrapper sets only `n_jobs` and `random_state=seed`.
 ## Inputs and outputs
 
 Splits are read from `<dataset_root>/<task>/<split_group>[/threshold_<t>]/{train,val,test}.parquet`.
-Split groups: `random_splits_grouped_sequence`, `random_splits_grouped_smiles`, `uniprot_time_splits`, `enzyme_sequence_splits`, `substrate_splits`. Threshold folders are found on disk.
+Split groups: `random_splits_grouped_sequence`, `random_splits_grouped_smiles`, `uniprot_time_splits`, `enzyme_sequence_splits`, `substrate_splits`. Threshold folders are found on disk. A group without threshold folders uses `all` as `<name>`.
 
 Everything the wrapper writes goes under `--work_dir` (default `outputs/baselines/UniKP`). It never writes to the split folders.
 
 ```
-<work_dir>/embeddings/proteins/...                   shared cache, built once
-<work_dir>/embeddings/smiles_trfm_v2_<fingerprint>/... one vector per (SMILES, chunk column)
+<work_dir>/embeddings/proteins_v3/...                shared cache, built once
+<work_dir>/embeddings/smiles_trfm_v3_<fingerprint>/... one vector per (SMILES, chunk column)
 <work_dir>/<task>/feature_matrices/<group>/<name>/   train/val/test .npz + metadata
-<work_dir>/<task>/results/<group>/<name>/seed_<s>/   metrics, predictions, model.joblib
+<work_dir>/<task>/<group>/<name>/seed_<s>/           metrics, predictions, model.joblib
 ```
 
 ## SMILES Transformer rule
@@ -45,10 +45,12 @@ Seeds are 666 777 888. Run from the submodule root with the `mldb` environment.
 The original kcat script drops multi-component SMILES (containing `.`) from the training data. The Km script does not. Use `--drop_dot_smiles_train` for kcat only.
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python emulator_bench/launch_parallel_retrain_original.py --tasks kcat --drop_dot_smiles_train --num_workers 4 --model_n_jobs 8
-CUDA_VISIBLE_DEVICES=1 python emulator_bench/launch_parallel_retrain_original.py --tasks km --num_workers 4 --model_n_jobs 8
+CUDA_VISIBLE_DEVICES=1 python emulator_bench/launch_parallel_retrain_original.py --tasks kcat --drop_dot_smiles_train --jobs 4 --model_n_jobs 8
+CUDA_VISIBLE_DEVICES=1 python emulator_bench/launch_parallel_retrain_original.py --tasks km --jobs 4 --model_n_jobs 8
 python emulator_bench/aggregate_unikp_results.py
 ```
+
+`--jobs N` runs N trainings at once. Extra Trees trains on CPU, so the launcher has no `--gpus`, `--runs_per_gpu` or `--amp`. Only the embedding cache step uses a GPU (`--cache_device`). Set `--model_n_jobs` so that `jobs x model_n_jobs` fits the CPU cores.
 
 Use `--dataset_root` and `--work_dir` to change the paths. The same `--drop_dot_smiles_train` choice must be used in the cache and feature steps of one task (the launcher passes it on).
 `--max_rows_per_split N` is for smoke tests only.

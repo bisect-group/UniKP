@@ -14,7 +14,8 @@ EMULATOR_ROOT = REPO_ROOT.parents[1]
 DEFAULT_DATASET_ROOT = EMULATOR_ROOT / "data" / "processed" / "datasets" / "kinetic_dataset"
 DEFAULT_WORK_DIR = EMULATOR_ROOT / "outputs" / "baselines" / "UniKP"
 TASKS = ["kcat", "km"]
-CACHE_VERSION = 2
+CACHE_VERSION = 3
+PROT_MODEL_ID = "Rostlab/prot_t5_xl_uniref50"
 TRFM_CHUNK = 100
 ROW_KEY_COLUMNS = ["ECNumber", "uniprot_id", "sequence", "smiles", "value", "Organism", "pH", "Temperature", "mutations", "substrate", "source", "enzymeType"]
 DEFAULT_SEEDS = [666, 777, 888]
@@ -40,12 +41,12 @@ def normalize_smiles(smiles: str) -> str:
 
 
 def protein_cache_key(sequence: str) -> str:
-    return stable_hash(normalize_sequence(sequence))
+    return stable_hash(f"{PROT_MODEL_ID}\t{normalize_sequence(sequence)}")
 
 
 def protein_cache_path(embeddings_dir: Path, sequence: str) -> Path:
     key = protein_cache_key(sequence)
-    return Path(embeddings_dir) / "proteins" / key[:2] / f"{key}.npz"
+    return Path(embeddings_dir) / f"proteins_v{CACHE_VERSION}" / key[:2] / f"{key}.npz"
 
 
 def smiles_cache_path(embeddings_dir: Path, smiles: str, column: int, fingerprint: str) -> Path:
@@ -140,7 +141,7 @@ def discover_split_jobs(base_dir: Path, split_groups: Optional[Iterable[str]] = 
         group_dir = Path(base_dir) / split_group
         if not group_dir.exists():
             continue
-        candidates = [(split_group, group_dir)]
+        candidates = [("all", group_dir)]
         if not (group_dir / "train.parquet").exists():
             candidates = [(child.name, child) for child in sorted(group_dir.glob("threshold_*")) if child.is_dir()]
         for split_name, directory in candidates:

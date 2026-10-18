@@ -13,8 +13,8 @@ from emulator_bench.common import DEFAULT_WORK_DIR, TASKS, atomic_save_csv, summ
 
 
 def collect_runs(work_dir: Path, task: str):
-    """Read `<work_dir>/<task>/results/<split_group>/<split_name>/seed_<seed>` run folders."""
-    root = Path(work_dir) / task / "results"
+    """Read `<work_dir>/<task>/<split_group>/<split_name>/seed_<seed>` run folders."""
+    root = Path(work_dir) / task
     rows = []
     for test_path in sorted(root.glob("*/*/seed_*/final_results_test.csv")):
         run_dir = test_path.parent

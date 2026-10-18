@@ -57,8 +57,8 @@ Original UniKP files outside `emulator_bench` are unchanged.
 ## Commands (all seeds x splits x tasks)
 From `EMULaToR/baselines/UniKP`, env `/home/adhil/.conda/envs/mldb/bin/python`:
 ```
-CUDA_VISIBLE_DEVICES=1 python emulator_bench/launch_parallel_retrain_original.py --tasks kcat --drop_dot_smiles_train --num_workers 4 --model_n_jobs 8
-CUDA_VISIBLE_DEVICES=1 python emulator_bench/launch_parallel_retrain_original.py --tasks km --num_workers 4 --model_n_jobs 8
+CUDA_VISIBLE_DEVICES=1 python emulator_bench/launch_parallel_retrain_original.py --tasks kcat --drop_dot_smiles_train --jobs 4 --model_n_jobs 8
+CUDA_VISIBLE_DEVICES=1 python emulator_bench/launch_parallel_retrain_original.py --tasks km --jobs 4 --model_n_jobs 8
 python emulator_bench/aggregate_unikp_results.py
 ```
 Run order matters little. The first run builds the embedding cache (GPU, ProtT5 fp32).
@@ -89,5 +89,5 @@ The original encodes the full dataset in chunks of 100 rows. Its positional enco
 
 - Table row `r` of `<task>_kinetic_params_1d.parquet` gets column `r % 100`. Split rows find their table row by a 12-column key (unique in both tables, no split row missing). A missing row uses column 0 and the count is printed.
 - Inputs are padded to 220 tokens, so a vector depends only on the SMILES and its column.
-- Cache version 2: folder `smiles_trfm_v2_<fingerprint>` (hash of the table SMILES column). Feature-matrix fingerprints include it.
+- Cache version 3: folders `proteins_v3` and `smiles_trfm_v3_<fingerprint>` (hash of the table SMILES column). The protein key includes the ProtT5 model id. Feature-matrix fingerprints include the version.
 - Check: first 250 rows of the kcat table, CPU, original `smiles_to_vec` against wrapper vectors: max abs diff 0.0, 250 of 250 rows exact. Smoke run of both CLIs on 16 rows per split finished.

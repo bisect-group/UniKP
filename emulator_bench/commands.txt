@@ -3,16 +3,19 @@
 
 # kcat (original script drops multi-component SMILES from train)
 CUDA_VISIBLE_DEVICES=1 python emulator_bench/launch_parallel_retrain_original.py \
-  --tasks kcat --drop_dot_smiles_train --num_workers 4 --model_n_jobs 8
+  --tasks kcat --drop_dot_smiles_train --jobs 4 --model_n_jobs 8
 
 # km
 CUDA_VISIBLE_DEVICES=1 python emulator_bench/launch_parallel_retrain_original.py \
-  --tasks km --num_workers 4 --model_n_jobs 8
+  --tasks km --jobs 4 --model_n_jobs 8
+
+# Parallel runs: --jobs sets the concurrent trainings (CPU only, no --gpus or --amp for Extra Trees)
+# Example: 4 runs at once with 8 threads each, as above.
 
 # Aggregate mean/std over seeds
 python emulator_bench/aggregate_unikp_results.py
 
-# Smoke test (tiny subset, one seed, outputs outside the repo)
+# Smoke test (tiny subset, one seed, own work_dir)
 CUDA_VISIBLE_DEVICES=1 python emulator_bench/launch_parallel_retrain_original.py \
-  --work_dir /tmp/unikp_smoke --max_rows_per_split 64 --seeds 666 \
+  --work_dir ../../outputs/baselines/UniKP_smoke --max_rows_per_split 64 --seeds 666 \
   --split_groups random_splits_grouped_sequence enzyme_sequence_splits --model_n_jobs 4
