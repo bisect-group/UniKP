@@ -13,18 +13,22 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 EMULATOR_ROOT = REPO_ROOT.parents[1]
 DEFAULT_DATASET_ROOT = EMULATOR_ROOT / "data" / "processed" / "datasets" / "kinetic_dataset"
 DEFAULT_WORK_DIR = EMULATOR_ROOT / "outputs" / "baselines" / "UniKP"
+# ProtT5 vectors are shared with the CataPro wrapper (same model, same text, same fp32 path).
+DEFAULT_PROTEIN_CACHE_DIR = EMULATOR_ROOT / "outputs" / "baselines" / "CataPro" / "embeddings" / "prot_t5_v2"
 TASKS = ["kcat", "km"]
-CACHE_VERSION = 3
+CACHE_VERSION = 5
 PROT_MODEL_ID = "Rostlab/prot_t5_xl_uniref50"
 TRFM_CHUNK = 100
-ROW_KEY_COLUMNS = ["ECNumber", "uniprot_id", "sequence", "smiles", "value", "Organism", "pH", "Temperature", "mutations", "substrate", "source", "enzymeType"]
+ROW_KEY_COLUMNS = ["ECNumber", "uniprot_id", "sequence", "smiles", "value", "Organism", "mutations", "substrate", "source", "enzymeType"]
 DEFAULT_SEEDS = [666, 777, 888]
 DEFAULT_SPLIT_GROUPS = [
     "random_splits_grouped_sequence",
     "random_splits_grouped_smiles",
     "uniprot_time_splits",
     "enzyme_sequence_splits",
+    "enzyme_structure_splits",
     "substrate_splits",
+    "conformer_cosine_splits",
 ]
 
 
@@ -32,21 +36,8 @@ def stable_hash(text: str) -> str:
     return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
 
 
-def normalize_sequence(sequence: str) -> str:
-    return "".join(str(sequence).strip().upper().split())
-
-
 def normalize_smiles(smiles: str) -> str:
     return str(smiles).strip()
-
-
-def protein_cache_key(sequence: str) -> str:
-    return stable_hash(f"{PROT_MODEL_ID}\t{normalize_sequence(sequence)}")
-
-
-def protein_cache_path(embeddings_dir: Path, sequence: str) -> Path:
-    key = protein_cache_key(sequence)
-    return Path(embeddings_dir) / f"proteins_v{CACHE_VERSION}" / key[:2] / f"{key}.npz"
 
 
 def smiles_cache_path(embeddings_dir: Path, smiles: str, column: int, fingerprint: str) -> Path:
@@ -79,11 +70,11 @@ class TaskTable:
         self.fingerprint = stable_hash("\n".join(frame["smiles"].astype(str)))[:12]
 
     def attach_columns(self, frame: pd.DataFrame) -> pd.DataFrame:
-        """Add `trfm_column`. Rows missing from the table use column 0 (the count is printed)."""
+        """Add `trfm_column`. Every split row must be in the task table."""
         columns = row_keys(frame).map(self.columns)
         if columns.isna().any():
-            print(f"WARNING: {int(columns.isna().sum())} of {len(frame)} split rows are not in the task table; using column 0.", flush=True)
-        return frame.assign(trfm_column=columns.fillna(0).astype(int))
+            raise ValueError(f"{int(columns.isna().sum())} of {len(frame)} split rows are not in the task table.")
+        return frame.assign(trfm_column=columns.astype(int))
 
 
 def ensure_parent(path: Path) -> None:

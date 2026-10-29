@@ -1,21 +1,37 @@
-# Run from the UniKP submodule root (EMULaToR/baselines/UniKP) with the mldb environment.
+# Run from the UniKP submodule root (EMULaToR/baselines/UniKP) with the mldb environment active.
+PY=python
 # Seeds default to 666 777 888. Outputs go to outputs/baselines/UniKP unless --work_dir is set.
+# ProtT5 vectors are read from outputs/baselines/CataPro/embeddings/prot_t5_v2 (--protein_cache_dir).
+# Missing ProtT5 vectors are computed on the GPU and added to that folder.
+# The SMILES Transformer runs on the CPU (--smiles_device cpu, default), as in the original; about 82 s (kcat) and 113 s (km).
+export CUDA_VISIBLE_DEVICES=0
 
-# kcat (original script drops multi-component SMILES from train)
-CUDA_VISIBLE_DEVICES=1 python emulator_bench/launch_parallel_retrain_original.py \
-  --tasks kcat --drop_dot_smiles_train --jobs 4 --model_n_jobs 8
+# List the 42 runs (no work is done)
+$PY emulator_bench/launch_parallel_retrain_original.py --dry_run
 
-# km
-CUDA_VISIBLE_DEVICES=1 python emulator_bench/launch_parallel_retrain_original.py \
-  --tasks km --jobs 4 --model_n_jobs 8
+# kcat: embeddings, feature matrices, 21 runs (the original kcat script drops multi-component SMILES from train)
+$PY emulator_bench/launch_parallel_retrain_original.py --tasks kcat --drop_dot_smiles_train --jobs 4 --model_n_jobs 12
 
-# Parallel runs: --jobs sets the concurrent trainings (CPU only, no --gpus or --amp for Extra Trees)
-# Example: 4 runs at once with 8 threads each, as above.
+# km: the original Km script keeps all rows
+$PY emulator_bench/launch_parallel_retrain_original.py --tasks km --jobs 4 --model_n_jobs 12
 
-# Aggregate mean/std over seeds
-python emulator_bench/aggregate_unikp_results.py
+# Stages one by one (same flags as the launcher passes)
+$PY emulator_bench/cache_embeddings.py --tasks kcat --drop_dot_smiles_train
+$PY emulator_bench/build_split_features.py --tasks kcat --drop_dot_smiles_train
+$PY emulator_bench/cache_embeddings.py --tasks km
+$PY emulator_bench/build_split_features.py --tasks km
+
+# One run
+$PY emulator_bench/train_single_target_tvt.py --feature_dir outputs/baselines/UniKP/kcat/feature_matrices/random_splits_grouped_sequence/all \
+  --out_dir outputs/baselines/UniKP/kcat/random_splits_grouped_sequence/all/seed_666 --seed 666 --model_n_jobs 12
+
+# Mean and std over seeds
+$PY emulator_bench/aggregate_unikp_results.py
+
+# Equivalence checks against the original code (CPU, then CPU plus real cache checks on cuda:0)
+bash emulator_bench/verify_equivalence.sh
+bash emulator_bench/verify_equivalence.sh --gpu
 
 # Smoke test (tiny subset, one seed, own work_dir)
-CUDA_VISIBLE_DEVICES=1 python emulator_bench/launch_parallel_retrain_original.py \
-  --work_dir ../../outputs/baselines/UniKP_smoke --max_rows_per_split 64 --seeds 666 \
-  --split_groups random_splits_grouped_sequence enzyme_sequence_splits --model_n_jobs 4
+$PY emulator_bench/launch_parallel_retrain_original.py --work_dir ../../outputs/baselines/UniKP_smoke --max_rows_per_split 64 --seeds 666 \
+  --split_groups random_splits_grouped_sequence enzyme_structure_splits --model_n_jobs 4

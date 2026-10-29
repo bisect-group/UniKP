@@ -1,5 +1,6 @@
 import argparse
 import json
+import resource
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -48,6 +49,13 @@ def save_predictions(path: Path, metadata: pd.DataFrame, y_true: np.ndarray, y_p
     atomic_save_csv(path, frame)
 
 
+def make_model(seed: int, n_jobs):
+    """The original code calls ExtraTreesRegressor() with sklearn defaults; only n_jobs and the seed are set here."""
+    from sklearn.ensemble import ExtraTreesRegressor
+
+    return ExtraTreesRegressor(n_jobs=n_jobs, random_state=seed)
+
+
 def maybe_threadpool_limits(model_n_jobs):
     if model_n_jobs is None or int(model_n_jobs) <= 0:
         return nullcontext()
@@ -86,23 +94,26 @@ def main():
     if len(y_train) == 0:
         raise ValueError(f"Training split is empty after filtering: {feature_dir}")
 
-    from sklearn.ensemble import ExtraTreesRegressor
-
-    # The original code calls ExtraTreesRegressor() with sklearn defaults; only n_jobs and the seed are set here.
-    model = ExtraTreesRegressor(n_jobs=args.model_n_jobs, random_state=args.seed)
+    model = make_model(args.seed, args.model_n_jobs)
     started = time.time()
     with maybe_threadpool_limits(args.model_n_jobs):
         model.fit(x_train, y_train)
+    fit_seconds = time.time() - started
 
+    started = time.time()
     joblib.dump(model, model_path)
+    dump_seconds = time.time() - started
     summary = {
-        "elapsed_seconds": time.time() - started,
+        "fit_seconds": fit_seconds,
+        "dump_seconds": dump_seconds,
+        "model_bytes": model_path.stat().st_size,
         "feature_dir": str(feature_dir),
         "out_dir": str(out_dir),
         "seed": args.seed,
         "model_n_jobs": args.model_n_jobs,
         "extra_trees_params": json.dumps(model.get_params(), sort_keys=True),
     }
+    started = time.time()
     for split_name, x, y, meta in (
         ("train", x_train, y_train, meta_train),
         ("val", x_val, y_val, meta_val),
@@ -114,6 +125,8 @@ def main():
         atomic_save_csv(out_dir / f"final_results_{split_name}.csv", pd.DataFrame([metrics]))
         save_predictions(out_dir / f"predictions_{split_name}.csv", meta, y, pred)
         summary.update({f"{split_name}_{key}": value for key, value in metrics.items() if key != "split"})
+    summary["predict_seconds"] = time.time() - started
+    summary["peak_rss_gb"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20
     atomic_save_json(out_dir / "run_summary.json", summary)
     print(f"Saved run to {out_dir}", flush=True)
 

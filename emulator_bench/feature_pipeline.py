@@ -1,4 +1,5 @@
 import gc
+import hashlib
 import os
 import re
 import sys
@@ -12,8 +13,6 @@ import torch
 try:
     from src.utils.rich_progress import progress
 except ModuleNotFoundError:
-    import sys
-    from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     from src.utils.rich_progress import progress
 from transformers import T5EncoderModel, T5Tokenizer
@@ -27,15 +26,11 @@ from build_vocab import WordVocab
 from pretrain_trfm import TrfmSeq2seq
 from utils import split
 
-from emulator_bench.common import PROT_MODEL_ID, normalize_sequence, normalize_smiles
-
-
-SMILES_VECTOR_DIM = 1024
-PROTEIN_VECTOR_DIM = 1024
+from emulator_bench.common import PROT_MODEL_ID, normalize_smiles
 
 
 def unikp_sequence_text(sequence: str) -> str:
-    sequence = normalize_sequence(sequence)
+    sequence = str(sequence)
     if len(sequence) > 1000:
         sequence = sequence[:500] + sequence[-500:]
     sequence = re.sub(r"[UZOB]", "X", sequence)
@@ -51,46 +46,38 @@ def load_prot_t5(device: torch.device):
     return tokenizer, model
 
 
+def protein_cache_file(cache_dir: Path, text: str) -> Path:
+    """Cache file of the CataPro wrapper: one fp32 .npy per processed text."""
+    key = hashlib.sha256(f"v2|{PROT_MODEL_ID}|max_len=1000|float32|{text}".encode("utf-8")).hexdigest()
+    return Path(cache_dir) / f"{key}.npy"
+
+
 def iter_protein_embeddings(
-    sequences: Sequence[str],
+    texts: Sequence[str],
     device: torch.device,
-    batch_size: int = 4,
-    max_tokens: int = 4096,
+    batch_size: int = 8,
 ) -> Iterator[Tuple[str, np.ndarray]]:
-    """Yield (sequence, vector) after each batch so callers can save finished work."""
-    if not sequences:
+    """Yield (text, vector) per batch for unique processed texts, so callers can save finished work.
+
+    Batches are length-sorted and padded to the longest text, as in the CataPro wrapper.
+    The vector is the fp32 mean over residue tokens (the final </s> token is excluded).
+    """
+    if not texts:
         return
     tokenizer, model = load_prot_t5(device)
     print(f"ProtT5 device: {device} | precision: fp32", flush=True)
 
-    unique = sorted({normalize_sequence(seq) for seq in sequences}, key=len, reverse=True)
-    batches: List[List[str]] = []
-    current: List[str] = []
-    current_tokens = 0
-    for sequence in unique:
-        token_count = len(sequence) + 1
-        if current and (len(current) >= batch_size or current_tokens + token_count > max_tokens):
-            batches.append(current)
-            current = []
-            current_tokens = 0
-        current.append(sequence)
-        current_tokens += token_count
-    if current:
-        batches.append(current)
-
-    for batch in progress(batches, desc="ProtT5 embedding", unit="batch"):
-        formatted = [unikp_sequence_text(sequence) for sequence in batch]
-        encoded = tokenizer(formatted, add_special_tokens=True, padding=True)
+    ordered = sorted(texts, key=len, reverse=True)
+    for start in progress(range(0, len(ordered), batch_size), desc="ProtT5 embedding", unit="batch"):
+        batch = ordered[start : start + batch_size]
+        encoded = tokenizer(batch, add_special_tokens=True, padding="longest")
         input_ids = torch.tensor(encoded["input_ids"], device=device)
         attention_mask = torch.tensor(encoded["attention_mask"], device=device)
         with torch.no_grad():
             hidden = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        hidden = hidden.detach().float().cpu()
-        mask = attention_mask.detach().cpu()
-        for idx, sequence in enumerate(batch):
-            seq_len = int((mask[idx] == 1).sum().item())
-            vector = hidden[idx, : seq_len - 1].mean(dim=0).numpy().astype(np.float32, copy=False)
-            yield sequence, vector
+        for idx, text in enumerate(batch):
+            seq_len = int(attention_mask[idx].sum().item())
+            yield text, hidden[idx, : seq_len - 1].mean(dim=0).cpu().numpy().astype(np.float32)
 
 
 def load_smiles_transformer(device: torch.device):
@@ -176,7 +163,15 @@ def save_npz_atomic(path: Path, payload: Dict[str, np.ndarray]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
     with open(tmp_path, "wb") as handle:
-        np.savez_compressed(handle, **payload)
+        np.savez(handle, **payload)
+    tmp_path.replace(path)
+
+
+def save_npy_atomic(path: Path, vector: np.ndarray) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(f".tmp.{os.getpid()}.npy")
+    np.save(tmp_path, vector.astype(np.float32, copy=False))
     tmp_path.replace(path)
 
 
