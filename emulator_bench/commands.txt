@@ -1,0 +1,19 @@
+# Run from the UniKP submodule root. PY is python from the env you use (we used the mldb conda env).
+# emulator_bench/run.sh runs all of this. Seeds default to 666 777 888. Outputs go to outputs/baselines/UniKP.
+PY=python
+export CUDA_VISIBLE_DEVICES=0   # only missing ProtT5 vectors use the GPU
+
+# kcat (the original kcat script drops multi-component SMILES from train)
+$PY emulator_bench/cache_embeddings.py --tasks kcat --drop_dot_smiles_train
+$PY emulator_bench/build_split_features.py --tasks kcat --drop_dot_smiles_train
+$PY emulator_bench/launch_parallel_retrain_original.py --tasks kcat --drop_dot_smiles_train --skip_cache --skip_feature_build --jobs 3 --model_n_jobs 12
+# km (the original Km script keeps all rows)
+$PY emulator_bench/cache_embeddings.py --tasks km
+$PY emulator_bench/build_split_features.py --tasks km
+$PY emulator_bench/launch_parallel_retrain_original.py --tasks km --skip_cache --skip_feature_build --jobs 3 --model_n_jobs 12
+
+$PY emulator_bench/aggregate_unikp_results.py
+
+# Equivalence checks against the original code (CPU, then also cuda:0)
+bash emulator_bench/verify_equivalence.sh
+bash emulator_bench/verify_equivalence.sh --gpu
